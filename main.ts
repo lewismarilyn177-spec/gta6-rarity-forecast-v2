@@ -1,6 +1,11 @@
 // GTA6 Trophy Rarity Forecast
 // Model: log-log linear trend per trophy (ln rarity vs ln hours since release),
 // pooled median slope with shrinkage, tanh-capped projection, logistic quantiles.
+// Launch-night stale-read prior: if the case cutoff is <24h after release and every
+// trophy's history shows at most one distinct non-null rarity value, the Exophase
+// rarity table is stale (pool hasn't refreshed yet). The projected center is shifted
+// down by 1.55 in log space and sigma is increased by 0.35 in quadrature with a
+// 0.6 floor, accounting for dilution when the tracked-player pool expands.
 
 interface Case {
   schema: string;
@@ -123,12 +128,15 @@ function processCase(c: Case): OutputTrophy[] {
     slopeIdx++;
   }
 
+  // Detect stale launch read: at < 24h after release AND every trophy has <= 1 distinct non-null value
+  const isStaleLaunchRead = atHours < 24 && series.every(s => s.xs.length <= 1);
+
   // Step 4 & 5: project and compute quantiles
   const CAP = 3.0;
   const Z = [-1.645, -0.674, 0, 0.674, 1.645];
   const baseSigma = 0.6 + 0.25 * Math.log1p(horizonDays);
   const launchNightRefresh = (atHours <= 24 && !anySlope) ? 0.4 : 0;
-  const totalSigma = clamp(Math.sqrt(baseSigma * baseSigma + launchNightRefresh * launchNightRefresh), 0.45, 1.30);
+  let totalSigma = clamp(Math.sqrt(baseSigma * baseSigma + launchNightRefresh * launchNightRefresh), 0.45, 1.30);
 
   const results: OutputTrophy[] = [];
   for (let ti = 0; ti < T; ti++) {
@@ -142,11 +150,19 @@ function processCase(c: Case): OutputTrophy[] {
 
     const yLast = Math.log(lastRarity / 100);
     const dt = Math.log(targetHours) - Math.log(lastHours);
-    const yTarget = yLast + CAP * Math.tanh(slope * dt / CAP);
+    let yTarget = yLast + CAP * Math.tanh(slope * dt / CAP);
+    let sigma = totalSigma;
+
+    if (isStaleLaunchRead) {
+      yTarget -= 1.55;
+      sigma = Math.sqrt(sigma * sigma + 0.35 * 0.35);
+      sigma = Math.max(sigma, 0.6);
+    }
+
     const medianR = Math.exp(yTarget) * 100;
 
     const qs = Z.map(z => {
-      const yq = yTarget + z * totalSigma;
+      const yq = yTarget + z * sigma;
       return clamp(100 / (1 + Math.exp(-yq)), 0, 100);
     }) as [number, number, number, number, number];
 
