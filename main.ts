@@ -126,6 +126,10 @@ function processCase(c: Case): OutputTrophy[] {
   }
 
   const lastState = states[states.length - 1];
+  // If no refresh was ever observed (launch-night stale page), the target very
+  // likely falls after Exophase's next big dilution refresh that we cannot see:
+  // shift the center down in log space and use a wide launch-dilution fan.
+  const sawRefresh = states.length >= 2;
 
   // Refresh times: a state change happens at some read; the refresh slot itself
   // is unknown, model refresh epochs as evenly spaced between observed changes.
@@ -228,7 +232,12 @@ function processCase(c: Case): OutputTrophy[] {
   for (let i = 0; i < T; i++) {
     const trophy = c.trophies[i];
     let cRate = pTarget > 0 ? (centerEarned[i] / pTarget) * 100 : 0;
-    if (trophy.tier === "platinum" || lastState.rates[i] >= 99.995) cRate = 100;
+    if (lastState.rates[i] >= 99.995) cRate = 100;
+    if (!sawRefresh) {
+      // launch-night stale prior: unseen dilution ahead
+      rows.push(makeRow(trophy.id, [lastState.rates[i]], 0, 1.2, 1.645, true, 0.75));
+      continue;
+    }
 
     // Logit-space fan: center logit +/- z * sigmaLogit, where sigmaLogit comes
     // from hazard scatter propagated through the remaining dilution.
@@ -247,7 +256,7 @@ function processCase(c: Case): OutputTrophy[] {
   return rows;
 }
 
-function makeRow(id: number, staleRates: number[] | null, cRate: number, sigLogit: number, z: number, stale: boolean): OutputTrophy {
+function makeRow(id: number, staleRates: number[] | null, cRate: number, sigLogit: number, z: number, stale: boolean, downShift = 0): OutputTrophy {
   const levels = [0.05, 0.25, 0.5, 0.75, 0.95];
   const zs = [-z, -0.674, 0, 0.674, z];
   const r0 = stale && staleRates ? (staleRates[0] ?? 0) : cRate;
@@ -257,7 +266,7 @@ function makeRow(id: number, staleRates: number[] | null, cRate: number, sigLogi
     let rate: number;
     if (stale && staleRates) {
       const r = staleRates[0] ?? 0;
-      const l = logit(r / 100);
+      const l = logit(r / 100) - downShift;
       rate = expit(l + zs[j] * sigLogit) * 100;
     } else {
       rate = expit(logit(cRate / 100) + zs[j] * sigLogit) * 100;
