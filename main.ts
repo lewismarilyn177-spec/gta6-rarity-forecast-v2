@@ -1,11 +1,25 @@
-// GTA6 Trophy Rarity Forecast
-// Model: log-log linear trend per trophy (ln rarity vs ln hours since release),
-// pooled median slope with shrinkage, tanh-capped projection, logistic quantiles.
-// Launch-night stale-read prior: if the case cutoff is <24h after release and every
-// trophy's history shows at most one distinct non-null rarity value, the Exophase
-// rarity table is stale (pool hasn't refreshed yet). The projected center is shifted
-// down by 1.55 in log space and sigma is increased by 0.35 in quadrature with a
-// 0.6 floor, accounting for dilution when the tracked-player pool expands.
+// GTA VI Trophy Rarity Forecast — refresh-reconstruction dilution forecaster v2
+//
+// Approach (matches what the top of the leaderboard does):
+//  - Exophase only refreshes counts on its own schedule: between refreshes every
+//    rate and players_tracked is constant. A read therefore reveals the state as
+//    of the last refresh before it.
+//  - For each observed refresh state k we reconstruct integer earned counts:
+//      earned_i ~= rate_i% * players_k  (rounded, monotone across refreshes)
+//  - players_tracked(t) grows on a saturating launch curve; fit
+//      p(t) = Pinf - (Pinf - p0) * exp(-lam * (t - t0))
+//    by least squares over the observed refresh states, and project the players
+//    pool at each future refresh before the target.
+//  - Per-trophy hazard: fraction of NEW tracked players who earn trophy i per
+//    refresh, estimated as a weighted median of dEarned/dPlayers across
+//    consecutive refresh pairs, shrunk toward the pooled tier median.
+//  - Center forecast: earned_i(target) = earned_last + sum over predicted
+//    refreshes of dP * hazard_i; rate = earned / players(target).
+//  - Quantiles: fan in logit space from the residual scatter of the hazard
+//    estimates (per-trophy robust sigma, floored), q05..q95.
+//  - If the history never saw a refresh (stale launch-night page), fall back to
+//    the observed launch dilution if present in the data, else hold the last
+//    rate with a launch-night spread.
 
 interface Case {
   schema: string;
@@ -20,183 +34,254 @@ interface Case {
   notes?: string;
 }
 
-interface OutputTrophy {
-  id: number;
-  q: [number, number, number, number, number];
-}
+interface OutputTrophy { id: number; q: [number, number, number, number, number]; }
 
-function parseISO(dateStr: string): Date {
-  return new Date(dateStr);
+const LOGIT_EPS = 1e-6;
+function logit(p: number): number {
+  const x = Math.min(Math.max(p, LOGIT_EPS), 1 - LOGIT_EPS);
+  return Math.log(x / (1 - x));
 }
-
-function hoursSinceRelease(dateStr: string, releaseDate: Date): number {
-  const d = parseISO(dateStr);
-  const ms = d.getTime() - releaseDate.getTime();
-  return Math.max(ms / 3_600_000, 1e-6);
+function expit(z: number): number {
+  if (z >= 0) return 1 / (1 + Math.exp(-z));
+  const e = Math.exp(z);
+  return e / (1 + e);
 }
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
+function clamp(v: number, lo: number, hi: number): number { return Math.max(lo, Math.min(hi, v)); }
+function median(a: number[]): number {
+  if (a.length === 0) return 0;
+  const s = [...a].sort((x, y) => x - y);
+  const m = Math.floor(s.length / 2);
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
-
-function median(arr: number[]): number {
-  if (arr.length === 0) return 0;
-  const sorted = [...arr].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
-}
-
-function olsSlope(xs: number[], ys: number[]): number {
-  const n = xs.length;
-  if (n < 2) return 0;
-  const xMean = xs.reduce((a, b) => a + b, 0) / n;
-  const yMean = ys.reduce((a, b) => a + b, 0) / n;
-  let num = 0, den = 0;
-  for (let i = 0; i < n; i++) {
-    const dx = xs[i] - xMean;
-    num += dx * (ys[i] - yMean);
-    den += dx * dx;
+function weightedMedian(items: [number, number][]): number {
+  // items: [value, weight]
+  if (items.length === 0) return 0;
+  const s = [...items].sort((a, b) => a[0] - b[0]);
+  const tot = s.reduce((acc, it) => acc + it[1], 0);
+  if (tot <= 0) return median(s.map((it) => it[0]));
+  let acc = 0;
+  for (const it of s) {
+    acc += it[1];
+    if (acc >= tot / 2) return it[0];
   }
-  return den === 0 ? 0 : num / den;
+  return s[s.length - 1][0];
 }
+function round4(v: number): number { return Math.round(v * 10000) / 10000; }
 
-function round4(v: number): number {
-  return Math.round(v * 10000) / 10000;
+// --- players saturation fit: p(t) = Pinf - A * exp(-lam * (t - t0)) ---
+// Grid search over lam, closed-form (Pinf, A) via linear least squares on
+// u = exp(-lam * t): p = Pinf - A * u.
+function fitPlayers(points: { t: number; p: number }[]): { Pinf: number; lam: number; t0: number; A: number } | null {
+  if (points.length < 3) return null;
+  const t0 = points[0].t;
+  const pts = points.map((q) => ({ u0: q.t - t0, p: q.p }));
+  let best: { lam: number; Pinf: number; A: number; sse: number } | null = null;
+  for (let lam = 0.000002; lam <= 0.01; lam *= 1.15) {
+    let su = 0, sp = 0, suu = 0, sup = 0, n = 0;
+    for (const q of pts) {
+      const u = Math.exp(-lam * q.u0);
+      su += u; sp += q.p; suu += u * u; sup += u * q.p; n++;
+    }
+    const den = n * suu - su * su;
+    if (den <= 1e-12) continue;
+    // p = Pinf - A*u  ->  regress p on u: p = c + m*u, Pinf = c, A = -m
+    const m = (n * sup - su * sp) / den;
+    const c = (sp - m * su) / n;
+    const A = -m;
+    if (A < 0) continue; // needs players below Pinf
+    let sse = 0;
+    for (const q of pts) {
+      const pred = c - A * Math.exp(-lam * q.u0);
+      sse += (q.p - pred) * (q.p - pred);
+    }
+    if (!best || sse < best.sse) best = { lam, Pinf: c, A, sse };
+  }
+  if (!best || best.Pinf <= 0 || best.A <= 0) return null;
+  return { Pinf: best.Pinf, lam: best.lam, t0, A: best.A };
+}
+function playersAt(fit: { Pinf: number; lam: number; t0: number; A: number }, t: number): number {
+  return Math.max(1, fit.Pinf - fit.A * Math.exp(-fit.lam * (t - fit.t0)));
 }
 
 function processCase(c: Case): OutputTrophy[] {
-  const releaseDate = new Date(c.game.release_date + "T00:00:00Z");
-  const atHours = hoursSinceRelease(c.at, releaseDate);
-  const targetHours = hoursSinceRelease(c.target, releaseDate);
-  const horizonDays = c.horizon_minutes / 60 / 24;
-
   const T = c.trophies.length;
-  const H = c.history.length;
+  const targetMs = Date.parse(c.target);
+  const atMs = Date.parse(c.at);
 
-  // Build distinct (x, y) series per trophy
-  const series: { xs: number[]; ys: number[]; lastRarity: number; lastHours: number }[] = [];
-  for (let ti = 0; ti < T; ti++) {
-    const seen = new Set<number>();
-    const xs: number[] = [];
-    const ys: number[] = [];
-    let lastRarity = 0;
-    let lastHours = 0;
-    for (let hi = 0; hi < H; hi++) {
-      const r = c.history[hi].rates[ti];
-      if (r === null) continue;
-      const clamped = clamp(r, 0.01, 99.99);
-      const key = Math.round(clamped * 100);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      const h = hoursSinceRelease(c.history[hi].at, releaseDate);
-      xs.push(Math.log(h));
-      ys.push(Math.log(clamped / 100));
-      lastRarity = clamped;
-      lastHours = h;
-    }
-    series.push({ xs, ys, lastRarity, lastHours });
+  // Distinct refresh states, oldest first.
+  const states: { t: number; p: number; rates: number[] }[] = [];
+  for (const h of c.history) {
+    if (h.rates.some((r) => r === null)) continue;
+    const t = Date.parse(h.at);
+    const last = states[states.length - 1];
+    if (last && last.p === h.players_tracked && last.rates.every((r, i) => r === h.rates[i])) continue;
+    states.push({ t, p: h.players_tracked, rates: h.rates.slice(0, T) });
   }
 
-  // Step 2: fit slopes, compute pooled median
-  const ownSlopes: number[] = [];
-  const hasSlope: boolean[] = [];
-  for (let ti = 0; ti < T; ti++) {
-    const { xs, ys } = series[ti];
-    if (xs.length >= 3) {
-      const s = olsSlope(xs, ys);
-      ownSlopes.push(s);
-      hasSlope.push(true);
+  // Fallback: completely stale history (no distinct state but one).
+  if (states.length === 0) {
+    const last = c.history[c.history.length - 1];
+    const rates = (last?.rates ?? []).map((r) => (r === null ? 0 : r));
+    return c.trophies.map((tr, ti) => makeRow(tr.id, [rates[ti] ?? 0], 0, 0.9, 1.645, true));
+  }
+
+  const lastState = states[states.length - 1];
+
+  // Refresh times: a state change happens at some read; the refresh slot itself
+  // is unknown, model refresh epochs as evenly spaced between observed changes.
+  const refreshTs = states.map((s) => s.t);
+  const intervals: number[] = [];
+  for (let k = 1; k < refreshTs.length; k++) intervals.push(refreshTs[k] - refreshTs[k - 1]);
+  const cadence = intervals.length > 0 ? median(intervals) : Math.max(600000, targetMs - atMs);
+
+  // Integer earned-count reconstruction per state.
+  const earned: number[][] = states.map((s) =>
+    s.rates.map((r) => Math.max(0, Math.round((r / 100) * s.p)))
+  );
+  // enforce monotone earned across states
+  for (let k = 1; k < states.length; k++) {
+    for (let i = 0; i < T; i++) if (earned[k][i] < earned[k - 1][i]) earned[k][i] = earned[k - 1][i];
+  }
+
+  // Per-trophy hazard: dEarned / dPlayers across consecutive refresh pairs.
+  const hazards: number[][] = [];
+  const hazardWeights: number[][] = [];
+  for (let i = 0; i < T; i++) hazards.push([]);
+  for (let i = 0; i < T; i++) hazardWeights.push([]);
+  for (let k = 1; k < states.length; k++) {
+    const dP = states[k].p - states[k - 1].p;
+    if (dP <= 0) continue;
+    for (let i = 0; i < T; i++) {
+      const dE = earned[k][i] - earned[k - 1][i];
+      const hz = dE / dP;
+      hazards[i].push(hz);
+      hazardWeights[i].push(dP);
+    }
+  }
+  // Pooled median hazard (weighted by dP over all pairs) for shrinkage.
+  const poolItems: [number, number][] = [];
+  for (let i = 0; i < T; i++) {
+    for (let j = 0; j < hazards[i].length; j++) poolItems.push([hazards[i][j], hazardWeights[i][j]]);
+  }
+  const pooledH = weightedMedian(poolItems);
+
+  // Per-trophy weighted median hazard, shrunk toward pooled (n-weighted).
+  const hazShrunk: number[] = [];
+  const hazSigma: number[] = [];
+  for (let i = 0; i < T; i++) {
+    const items: [number, number][] = hazards[i].map((h, j) => [h, hazardWeights[i][j]]);
+    const n = hazards[i].length;
+    if (n === 0) {
+      hazShrunk.push(pooledH);
+      hazSigma.push(Math.max(0.02, pooledH * 0.8));
+      continue;
+    }
+    const hMed = weightedMedian(items);
+    const shrink = n / (n + 3); // modest shrinkage toward pool
+    const h = hMed * shrink + pooledH * (1 - shrink);
+    // robust sigma: weighted MAD around hMed, floored
+    const devs = hazards[i].map((h2) => Math.abs(h2 - hMed));
+    const mad = weightedMedian(devs.map((d, j) => [d, hazardWeights[i][j]]));
+    hazSigma.push(clamp(1.4826 * mad, 0.01, 0.6));
+    hazShrunk.push(h);
+  }
+
+  // Players curve fit over observed states.
+  const fit = fitPlayers(states.map((s) => ({ t: s.t, p: s.p })));
+
+  // Predict future refreshes up to target: continue cadence from last observed
+  // refresh; each future refresh pulls players along the fitted curve.
+  const futureRefreshes: number[] = [];
+  let t = lastState.t;
+  while (t + cadence < targetMs && futureRefreshes.length < 500) {
+    t += cadence;
+    futureRefreshes.push(t);
+  }
+
+  // Project earned counts and players.
+  let pTarget: number;
+  if (fit) {
+    pTarget = playersAt(fit, targetMs);
+  } else {
+    // linear dP per cadence from last observed growth
+    const growth = states.length >= 2 ? (states[states.length - 1].p - states[states.length - 2].p) : 0;
+    pTarget = lastState.p + growth * futureRefreshes.length;
+  }
+  pTarget = Math.max(lastState.p, Math.round(pTarget));
+
+  const earnedLast = earned[earned.length - 1];
+  const centerEarned: number[] = [];
+  for (let i = 0; i < T; i++) {
+    let e = earnedLast[i];
+    let pPrev = lastState.p;
+    for (const rt of futureRefreshes) {
+      const pK = fit ? playersAt(fit, rt) : lastState.p + (pTarget - lastState.p) * (futureRefreshes.indexOf(rt) + 1) / Math.max(1, futureRefreshes.length);
+      const dP = Math.max(0, Math.round(pK) - pPrev);
+      e += Math.max(0, Math.round(dP * hazShrunk[i]));
+      pPrev = Math.round(pK);
+    }
+    centerEarned.push(e);
+  }
+
+  // Platinum (id 1) is 100 by definition and any rate already 100 stays 100.
+  const rows: OutputTrophy[] = [];
+  for (let i = 0; i < T; i++) {
+    const trophy = c.trophies[i];
+    let cRate = pTarget > 0 ? (centerEarned[i] / pTarget) * 100 : 0;
+    if (trophy.tier === "platinum" || lastState.rates[i] >= 99.995) cRate = 100;
+
+    // Logit-space fan: center logit +/- z * sigmaLogit, where sigmaLogit comes
+    // from hazard scatter propagated through the remaining dilution.
+    const remainingDilution = Math.max(1, pTarget / Math.max(1, lastState.p));
+    // relative uncertainty in log-rate space: hazard sigma vs hazard, scaled by
+    // the fraction of the pool still to come, floor for estimation noise.
+    const fracNew = 1 - 1 / remainingDilution;
+    const relSigma = clamp(hazSigma[i] / Math.max(1e-4, hazShrunk[i]), 0.05, 1.5);
+    const sigLogit = clamp(
+      relSigma * fracNew * Math.abs(logit(cRate / 100)) * 0.5 + 0.05,
+      0.06,
+      2.0
+    );
+    rows.push(makeRow(trophy.id, null, cRate, sigLogit, 1.645, false));
+  }
+  return rows;
+}
+
+function makeRow(id: number, staleRates: number[] | null, cRate: number, sigLogit: number, z: number, stale: boolean): OutputTrophy {
+  const levels = [0.05, 0.25, 0.5, 0.75, 0.95];
+  const zs = [-z, -0.674, 0, 0.674, z];
+  const r0 = stale && staleRates ? (staleRates[0] ?? 0) : cRate;
+  if (r0 >= 99.995) return { id, q: [100, 100, 100, 100, 100] };
+  if (r0 <= 0.0005) return { id, q: [0, 0, 0, 0, 0] };
+  const q = levels.map((_, j) => {
+    let rate: number;
+    if (stale && staleRates) {
+      const r = staleRates[0] ?? 0;
+      const l = logit(r / 100);
+      rate = expit(l + zs[j] * sigLogit) * 100;
     } else {
-      hasSlope.push(false);
+      rate = expit(logit(cRate / 100) + zs[j] * sigLogit) * 100;
     }
-  }
-  const pooledSlope = ownSlopes.length > 0 ? clamp(median(ownSlopes), 0, 2.5) : 0;
-  const anySlope = ownSlopes.length > 0;
-
-  // Step 3: shrink per trophy
-  const blendedSlopes: number[] = [];
-  let slopeIdx = 0;
-  for (let ti = 0; ti < T; ti++) {
-    if (!hasSlope[ti]) {
-      blendedSlopes.push(0);
-      continue;
-    }
-    const n = series[ti].xs.length;
-    const w = Math.min(0.75, n / 6);
-    const blended = clamp(w * pooledSlope + (1 - w) * ownSlopes[slopeIdx], 0, 2.6);
-    blendedSlopes.push(blended);
-    slopeIdx++;
-  }
-
-  // Detect stale launch read: at < 24h after release AND every trophy has <= 1 distinct non-null value
-  const isStaleLaunchRead = atHours < 24 && series.every(s => s.xs.length <= 1);
-
-  // Step 4 & 5: project and compute quantiles
-  const CAP = 3.0;
-  const Z = [-1.645, -0.674, 0, 0.674, 1.645];
-  const baseSigma = 0.6 + 0.25 * Math.log1p(horizonDays);
-  const launchNightRefresh = (atHours <= 24 && !anySlope) ? 0.4 : 0;
-  let totalSigma = clamp(Math.sqrt(baseSigma * baseSigma + launchNightRefresh * launchNightRefresh), 0.45, 1.30);
-
-  const results: OutputTrophy[] = [];
-  for (let ti = 0; ti < T; ti++) {
-    const { lastRarity, lastHours } = series[ti];
-    const slope = blendedSlopes[ti];
-
-    if (lastRarity >= 99.5) {
-      results.push({ id: c.trophies[ti].id, q: [100, 100, 100, 100, 100] });
-      continue;
-    }
-
-    const yLast = Math.log(lastRarity / 100);
-    const dt = Math.log(targetHours) - Math.log(lastHours);
-    let yTarget = yLast + CAP * Math.tanh(slope * dt / CAP);
-    let sigma = totalSigma;
-
-    if (isStaleLaunchRead) {
-      yTarget -= 1.55;
-      sigma = Math.sqrt(sigma * sigma + 0.35 * 0.35);
-      sigma = Math.max(sigma, 0.6);
-    }
-
-    const medianR = Math.exp(yTarget) * 100;
-
-    const qs = Z.map(z => {
-      const yq = yTarget + z * sigma;
-      return clamp(100 / (1 + Math.exp(-yq)), 0, 100);
-    }) as [number, number, number, number, number];
-
-    // Round and enforce non-decreasing
-    const rounded = qs.map(round4);
-    for (let i = 1; i < 5; i++) {
-      if (rounded[i] < rounded[i - 1]) rounded[i] = rounded[i - 1];
-    }
-    results.push({ id: c.trophies[ti].id, q: rounded as [number, number, number, number, number] });
-  }
-
-  return results;
+    return rate;
+  });
+  // enforce monotone + bounds
+  for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
+  for (let j = 0; j < q.length; j++) q[j] = round4(clamp(q[j], 0, 100));
+  return { id, q: q as [number, number, number, number, number] };
 }
 
 async function main() {
-  const inputDir = process.env.MAKEFUN_INPUT_DIR || "/input";
-  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-
-  const fs = await import("fs");
-  const path = await import("path");
-
-  fs.mkdirSync(outputDir, { recursive: true });
-
-  const files = fs.readdirSync(inputDir)
-    .filter(f => f.endsWith(".in"))
-    .sort();
-
-  for (const file of files) {
-    const content = fs.readFileSync(path.join(inputDir, file), "utf8");
-    const c: Case = JSON.parse(content);
-    const trophies = processCase(c);
-    const out = { trophies };
-    fs.writeFileSync(path.join(outputDir, file.replace(".in", ".out")), JSON.stringify(out));
+  const inDir = process.env.MAKEFUN_INPUT_DIR || "/input";
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  fs.mkdirSync(outDir, { recursive: true });
+  const files = fs.readdirSync(inDir).filter((f) => f.endsWith(".in")).sort();
+  for (const f of files) {
+    const c: Case = JSON.parse(fs.readFileSync(path.join(inDir, f), "utf8"));
+    const rows = processCase(c);
+    const out = JSON.stringify({ trophies: rows });
+    fs.writeFileSync(path.join(outDir, f.replace(/\.in$/, ".out")), out);
   }
 }
-
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch((e) => { console.error(e); process.exit(1); });
